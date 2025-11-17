@@ -135,19 +135,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Private → halaman jualan premium
     text = (
         "👋 Halo!\n\n"
-        "Aku adalah bot *filter kata kasar* untuk grup Telegram.\n\n"
-        "🧹 **Fitur Gratis:**\n"
-        "• Auto hapus kata kasar default\n"
-        "• Tambah kata custom per grup (/addword)\n"
-        "• Hapus & list kata custom (/delword /listword)\n\n"
-        "✨ **Fitur Premium (Rp 5.000 / bulan):**\n"
-        "• Filter lebih bersih dan agresif\n"
-        "• Bisa setting lebih fleksibel\n"
-        "• Mode clean tanpa bloatware\n"
-        "• Dibuat khusus untuk menjaga grup lebih aman\n\n"
-        "💸 Mau langganan premium?\n"
-        "👉 Kontak: @VanzzSkyyID\n"
-        "Siap dipakai ribuan grup tanpa limit."
+        "Aku bot *filter kata kasar* khusus buat grup Telegram.\n\n"
+        "🧹 **Cara pakai (GRATIS):**\n"
+        "• Tinggal *add aku ke grup kamu* lalu jadikan admin (izin hapus pesan).\n"
+        "• Semua fitur dasar bisa dipakai gratis tanpa batas.\n"
+        "• Admin grup bisa tambah kata custom: /addword, /delword, /listword.\n\n"
+        "✨ **Mode Premium (Rp 5.000 / bulan / grup):**\n"
+        "• Filter lebih bersih & agresif\n"
+        "• Pengaturan lebih fleksibel\n"
+        "• Mode clean tanpa bloatware\n\n"
+        "💸 Mau upgrade ke premium?\n"
+        "👉 Chat aja: @VanzzSkyyID"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
