@@ -13,7 +13,7 @@ from telegram.ext import (
 
 # ================== CONFIG ==================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 DATA_FILE = Path("blocked_words.json")
 
