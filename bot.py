@@ -1,323 +1,672 @@
 import os
 import json
-import re
+import time
+import logging
 from pathlib import Path
-from telegram import Update
+from functools import wraps
+from typing import Tuple, Optional
+
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ChatPermissions,
+)
 from telegram.ext import (
-    ApplicationBuilder, MessageHandler, CommandHandler,
-    ContextTypes, filters
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
 )
 
-# ================== CONFIG ==================
+# ===================== CONFIG =====================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 if not TELEGRAM_TOKEN:
     raise RuntimeError("ENV TELEGRAM_TOKEN belum di-set!")
 
-DATA_FILE = Path("blocked_words.json")
+# GANTI dengan user id lu (bisa lebih dari satu)
+OWNER_IDS = {123456789}
+
+GROUP_LINK = "https://t.me/VANZSHOPGROUP"
+CHANNEL_LINK = "https://t.me/VanzDisscusion"
+
+BOT_NAME = "VanzSecurity Bot"
+BOT_VERSION = "1.0"
+
 PREMIUM_FILE = Path("premium.json")
 
-CREDIT = "Premium powered by @VanzzSkyyID"
+# ==================================================
 
-# Default kata kasar global
-DEFAULT_BLOCKED_WORDS = {
-    "anjing", "anjg", "anj", "njing",
-    "bangsat", "bgsat", "bgs",
-    "kontol", "kontl",
-    "memek", "mmk", "meki",
-    "peler", "pler",
-    "pantek", "panteq",
-    "puki", "pukimak",
-    "tai", "tae", "taik",
-    "goblok", "gblk", "goblog",
-    "tolol", "idiot", "bego",
-    "kampret", "kampang",
-    "fuck", "fck", "fucking",
-    "shit", "bullshit",
-    "bitch", "btch",
-    "asshole", "assh0le",
-    "whore", "slut",
-}
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-CHAT_CUSTOM_WORDS = {}
-PREMIUM_GROUPS = {}
+# cache admin per grup (di-RAM)
+chat_admins_cache: dict[int, set[int]] = {}
 
-# ================== STORAGE ==================
 
-def load_all():
-    """Load both JSON files on startup"""
-    global CHAT_CUSTOM_WORDS, PREMIUM_GROUPS
+# =============== PREMIUM STORAGE ===============
 
-    # blocked words
-    if DATA_FILE.exists():
-        try:
-            CHAT_CUSTOM_WORDS = json.loads(DATA_FILE.read_text(encoding="utf-8")).get("chats", {})
-        except Exception:
-            CHAT_CUSTOM_WORDS = {}
-    else:
-        CHAT_CUSTOM_WORDS = {}
+def load_premium() -> dict:
+    if not PREMIUM_FILE.exists():
+        return {}
+    try:
+        with PREMIUM_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    # premium groups
-    if PREMIUM_FILE.exists():
-        try:
-            PREMIUM_GROUPS = json.loads(PREMIUM_FILE.read_text(encoding="utf-8")).get("premium_groups", {})
-        except Exception:
-            PREMIUM_GROUPS = {}
-    else:
-        PREMIUM_GROUPS = {}
 
-def save_words():
-    DATA_FILE.write_text(
-        json.dumps({"chats": CHAT_CUSTOM_WORDS}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+def save_premium(data: dict):
+    try:
+        with PREMIUM_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("Gagal menyimpan premium.json: %s", e)
+
+
+def is_chat_premium(chat_id: int) -> Tuple[bool, Optional[int]]:
+    """Return (is_premium, expires_at)."""
+    data = load_premium()
+    info = data.get(str(chat_id))
+    if not info:
+        return False, None
+
+    expires_at = int(info.get("expires_at", 0))
+    if expires_at != 0 and expires_at < int(time.time()):
+        # sudah expired → hapus
+        data.pop(str(chat_id), None)
+        save_premium(data)
+        return False, expires_at
+
+    return True, expires_at
+
+
+# =============== HELPER DECORATORS ===============
+
+def admin_required(func):
+    """Command hanya boleh dipakai admin grup / owner bot."""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        user = update.effective_user
+        message = update.effective_message
+
+        if chat.type not in ("group", "supergroup"):
+            await message.reply_text("Perintah ini hanya bisa di dalam grup.")
+            return
+
+        # ambil admin dari cache kalau ada
+        admin_ids = chat_admins_cache.get(chat.id)
+
+        if not admin_ids:
+            admins = await context.bot.get_chat_administrators(chat.id)
+            admin_ids = {a.user.id for a in admins}
+            chat_admins_cache[chat.id] = admin_ids
+
+        if user.id not in admin_ids and user.id not in OWNER_IDS:
+            await message.reply_text("Perintah ini hanya untuk Admin / Owner grup.")
+            return
+
+        return await func(update, context)
+
+    return wrapper
+
+
+def premium_required(func):
+    """Fitur hanya bisa dipakai di grup premium."""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        message = update.effective_message
+
+        if chat.type not in ("group", "supergroup"):
+            await message.reply_text("Fitur ini khusus untuk grup premium.")
+            return
+
+        ok, expires_at = is_chat_premium(chat.id)
+        if not ok:
+            await message.reply_text(
+                "❌ Grup ini belum premium / sudah expired.\n"
+                "Hubungi owner bot untuk aktivasi premium."
+            )
+            return
+
+        return await func(update, context)
+
+    return wrapper
+
+
+# =============== KEYBOARD BUILDERS ===============
+
+def build_main_menu() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("⚔️ Security", callback_data="menu_security"),
+            InlineKeyboardButton("🛠 Moderation", callback_data="menu_moderation"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Utility", callback_data="menu_utility"),
+            InlineKeyboardButton("😎 Fun", callback_data="menu_fun"),
+        ],
+        [
+            InlineKeyboardButton("⭐ Premium", callback_data="menu_premium"),
+            InlineKeyboardButton("👑 Owner Panel", callback_data="menu_owner"),
+        ],
+        [
+            InlineKeyboardButton("🆘 Bantuan Bot", callback_data="menu_help"),
+            InlineKeyboardButton("📖 Perintah Bot", callback_data="menu_commands"),
+        ],
+        [
+            InlineKeyboardButton("📢 Channel", url=CHANNEL_LINK),
+            InlineKeyboardButton("💬 Grup", url=GROUP_LINK),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_back_menu(parent: str = "main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Kembali", callback_data=f"menu_{parent}")]]
     )
 
-def save_premium():
-    PREMIUM_FILE.write_text(
-        json.dumps({"premium_groups": PREMIUM_GROUPS}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
-def is_premium(chat_id: int) -> bool:
-    cid = str(chat_id)
-    return cid in PREMIUM_GROUPS and PREMIUM_GROUPS[cid].get("active", False)
-
-# ================== TEXT FILTER ==================
-
-def normalize_text(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", "", text)
-    return re.sub(r"(.)\1{2,}", r"\1\1", text)
-
-def get_all_blocked(chat_id: int):
-    blocked = set(DEFAULT_BLOCKED_WORDS)
-    custom = CHAT_CUSTOM_WORDS.get(str(chat_id), [])
-    blocked.update(custom)
-
-    # Premium gets extra aggressive words
-    if is_premium(chat_id):
-        blocked.update({"asu", "bangke", "kampang", "pukimak"})
-
-    return blocked
-
-def contains_blocked_word(text: str, chat_id: int):
-    if not text:
-        return False
-
-    norm = normalize_text(text)
-    tokens = norm.split()
-    blocked = get_all_blocked(chat_id)
-
-    for t in tokens:
-        for bad in blocked:
-            if bad in t:
-                return True
-
-    for bad in blocked:
-        if bad in norm:
-            return True
-
-    return False
-
-# ================== COMMAND HANDLERS ==================
+# =============== COMMAND HANDLERS ===============
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-
-    # Grup → simple info
-    if chat.type != chat.PRIVATE:
-        return await update.message.reply_text(
-            "👋 Bot filter kata kasar aktif di grup ini.\n"
-            "Pesan mengandung kata kasar otomatis dihapus."
-        )
-
-    # Private → halaman jualan premium
     text = (
-        "👋 Halo!\n\n"
-        "Aku bot *filter kata kasar* khusus buat grup Telegram.\n\n"
-        "🧹 **Cara pakai (GRATIS):**\n"
-        "• Tinggal *add aku ke grup kamu* lalu jadikan admin (izin hapus pesan).\n"
-        "• Semua fitur dasar bisa dipakai gratis tanpa batas.\n"
-        "• Admin grup bisa tambah kata custom: /addword, /delword, /listword.\n\n"
-        "✨ **Mode Premium (Rp 5.000 / bulan / grup):**\n"
-        "• Filter lebih bersih & agresif\n"
-        "• Pengaturan lebih fleksibel\n"
-        "• Mode clean tanpa bloatware\n\n"
-        "💸 Mau upgrade ke premium?\n"
-        "👉 Chat aja: @VanzzSkyyID"
+        f"👋 Selamat datang di *{BOT_NAME}* (v{BOT_VERSION})\n\n"
+        "Bot ini membantu mengamankan dan mengelola grup Telegram.\n"
+        "Gunakan tombol di bawah untuk mengakses menu.\n\n"
+        f"🔗 *Grup:* {GROUP_LINK}\n"
+        f"📢 *Channel:* {CHANNEL_LINK}\n\n"
+        "Ketik /help untuk lihat perintah dasar."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def addword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    if chat.type == "private":
-        return await msg.reply_text("Command ini hanya untuk grup.")
-
-    user = update.effective_user
-    member = await context.bot.get_chat_member(chat.id, user.id)
-
-    if member.status not in ("administrator", "creator"):
-        return await msg.reply_text("❌ Hanya admin yang bisa menambah kata.")
-
-    if not context.args:
-        return await msg.reply_text("Usage: `/addword kata_kasar`", parse_mode="Markdown")
-
-    word = re.sub(r"[^a-z0-9]", "", " ".join(context.args).lower())
-    if not word:
-        return await msg.reply_text("❌ Kata tidak valid.")
-
-    cid = str(chat.id)
-    custom = CHAT_CUSTOM_WORDS.get(cid, [])
-    if word not in custom:
-        custom.append(word)
-        CHAT_CUSTOM_WORDS[cid] = custom
-        save_words()
-
-    reply = f"✅ Kata `{word}` ditambahkan."
-    if is_premium(chat.id):
-        reply += f"\n✨ {CREDIT}"
-
-    await msg.reply_text(reply, parse_mode="Markdown")
-
-async def delword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    cid = str(chat.id)
-    if cid not in CHAT_CUSTOM_WORDS:
-        return await msg.reply_text("📭 Belum ada kata custom.")
-
-    if not context.args:
-        return await msg.reply_text("Usage: `/delword kata_kasar`", parse_mode="Markdown")
-
-    word = re.sub(r"[^a-z0-9]", "", " ".join(context.args).lower())
-    if word in CHAT_CUSTOM_WORDS[cid]:
-        CHAT_CUSTOM_WORDS[cid].remove(word)
-        save_words()
-        return await msg.reply_text(f"🗑 Kata `{word}` dihapus.", parse_mode="Markdown")
-
-    await msg.reply_text("❌ Kata tidak ada di list custom.")
-
-async def listword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = str(update.effective_chat.id)
-    words = CHAT_CUSTOM_WORDS.get(cid, [])
-
-    if not words:
-        return await update.message.reply_text("📭 Belum ada kata custom.")
-
-    text = "📃 *Daftar kata custom:*\n`" + ", ".join(words) + "`"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# ================== PREMIUM COMMANDS ==================
-
-BOT_OWNER_ID = 6593622247  # <===== GANTI dengan User ID Telegram lu
-
-async def premium_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    msg = update.effective_message
-
-    if user.id != BOT_OWNER_ID:
-        return await msg.reply_text("❌ Lu bukan owner bot.")
-
-    if not context.args:
-        return await msg.reply_text("Usage: `/premium_add <group_id>`")
-
-    gid = context.args[0]
-    PREMIUM_GROUPS[gid] = {"active": True}
-    save_premium()
-
-    await msg.reply_text(
-        f"✨ Grup `{gid}` sekarang PREMIUM!\n{CREDIT}",
-        parse_mode="Markdown"
+    await update.effective_message.reply_markdown(
+        text,
+        reply_markup=build_main_menu(),
     )
 
-async def premium_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    msg = update.effective_message
 
-    if user.id != BOT_OWNER_ID:
-        return await msg.reply_text("❌ Lu bukan owner bot.")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "*Perintah Dasar*\n\n"
+        "👮 = Admin & Moderator\n"
+        "👑 = Admin / Owner\n\n"
+        "👑 /reload - memperbarui daftar Admin dan hak istimewanya\n"
+        "👮 /settings - mengelola semua pengaturan Bot di grup\n\n"
+        "👮 /ban - blokir pengguna dari grup\n"
+        "👮 /mute - mode hanya-membaca (bisa lihat, tidak bisa chat)\n"
+        "👮 /kick - tendang pengguna dari grup\n"
+        "👮 /unban - hapus blokir pengguna dari grup\n\n"
+        "👮 /info - info tentang pengguna (balas pesan target)\n"
+        "👮 /infopvt - kirim info pengguna via obrolan pribadi\n\n"
+        "👮 /staff - daftar lengkap staf grup\n\n"
+        "⭐ Premium:\n"
+        "👑 /addpremium <hari> - jadikan grup ini premium / perpanjang\n"
+        "👮 /premstatus - cek status premium grup\n"
+    )
+    await update.effective_message.reply_markdown(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Kembali ke Menu", callback_data="menu_main")]]
+        ),
+    )
 
-    if not context.args:
-        return await msg.reply_text("Usage: `/premium_remove <group_id>`")
 
-    gid = context.args[0]
-    PREMIUM_GROUPS.pop(gid, None)
-    save_premium()
+# --------- BASIC MODERATION ---------
 
-    await msg.reply_text(f"⛔ Premium dicabut dari grup `{gid}`.")
+@admin_required
+async def reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    admins = await context.bot.get_chat_administrators(chat.id)
+    admin_ids = {a.user.id for a in admins}
+    chat_admins_cache[chat.id] = admin_ids
 
-async def premium_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
+    await update.effective_message.reply_text(
+        f"✅ Daftar admin & moderator di grup ini sudah diperbarui.\n"
+        f"Total admin: {len(admin_ids)}"
+    )
 
-    if is_premium(cid):
-        await update.message.reply_text(
-            f"✨ Grup ini *PREMIUM*\n{CREDIT}",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text("❌ Grup ini belum premium.")
 
-# ================== TEXT FILTER HANDLER ==================
+@admin_required
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "⚙️ *Panel Pengaturan Grup*\n\n"
+        "Di sini nanti kamu bisa mengatur:\n"
+        "- Anti-toxic\n"
+        "- Anti-link\n"
+        "- Hukuman otomatis\n"
+        "- Dll.\n"
+    )
 
-async def text_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
+    keyboard = [
+        [InlineKeyboardButton("⚔️ Security Settings", callback_data="settings_security")],
+        [InlineKeyboardButton("🛠 Moderation Settings", callback_data="settings_moderation")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_main")],
+    ]
+
+    await update.effective_message.reply_markdown(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+@admin_required
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
     chat = update.effective_chat
 
-    if not msg or not msg.text:
+    target = None
+    reason = " ".join(context.args) if context.args else ""
+
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+
+    if not target:
+        await message.reply_text("Balas pesan orang yang mau di /ban ya bro.")
         return
 
-    if not contains_blocked_word(msg.text, chat.id):
-        return
-
-    # Try delete
     try:
-        await msg.delete()
-        deleted = True
-    except:
-        deleted = False
+        await context.bot.ban_chat_member(chat.id, target.id)
+        await message.reply_text(
+            f"🚫 Pengguna {target.mention_html()} telah diblokir dari grup.\n"
+            f"Alasan: {reason or '-'}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("Gagal ban: %s", e)
+        await message.reply_text("Gagal ban. Pastikan bot punya hak ban member.")
 
-    # ALWAYS show info
-    if deleted:
-        if is_premium(chat.id):
-            info = "🧹 Pesan *kata kasar* telah dihapus (mode premium)."
-        else:
-            info = "🧹 Pesan *kata kasar* telah dihapus."
-    else:
-        info = "❗ Pesan kata kasar terdeteksi, tapi bot tidak punya izin hapus."
 
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=info,
-        parse_mode="Markdown"
+@admin_required
+async def mute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message.reply_to_message:
+        await message.reply_text("Balas pesan orang yang mau di /mute ya bro.")
+        return
+
+    target = message.reply_to_message.from_user
+
+    perms = ChatPermissions(
+        can_send_messages=False,
+        can_send_media_messages=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
     )
 
-# ================== MAIN ==================
+    try:
+        await context.bot.restrict_chat_member(chat.id, target.id, permissions=perms)
+        await message.reply_text(
+            f"🤐 {target.mention_html()} sekarang hanya bisa membaca.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("Gagal mute: %s", e)
+        await message.reply_text("Gagal mute. Pastikan bot punya hak restrict.")
+
+
+@admin_required
+async def kick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message.reply_to_message:
+        await message.reply_text("Balas pesan orang yang mau di /kick ya bro.")
+        return
+
+    target = message.reply_to_message.from_user
+
+    try:
+        await context.bot.ban_chat_member(chat.id, target.id)
+        await context.bot.unban_chat_member(chat.id, target.id)
+        await message.reply_text(
+            f"👢 {target.mention_html()} sudah ditendang dari grup.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("Gagal kick: %s", e)
+        await message.reply_text("Gagal kick. Pastikan bot punya hak ban member.")
+
+
+@admin_required
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not context.args:
+        await message.reply_text("Pakai: /unban <user_id>")
+        return
+
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await message.reply_text("user_id tidak valid.")
+        return
+
+    try:
+        await context.bot.unban_chat_member(chat.id, user_id)
+        await message.reply_text(f"✅ User dengan ID {user_id} sudah di-unban.")
+    except Exception as e:
+        logger.exception("Gagal unban: %s", e)
+        await message.reply_text("Gagal unban. Pastikan bot punya hak ban/unban member.")
+
+
+@admin_required
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+
+    target = message.reply_to_message.from_user if message.reply_to_message else update.effective_user
+
+    text = (
+        f"🧾 *Info Pengguna*\n\n"
+        f"ID: `{target.id}`\n"
+        f"Nama: {target.full_name}\n"
+        f"Username: @{target.username if target.username else '-'}\n"
+        f"Bot: {'Ya' if target.is_bot else 'Tidak'}\n"
+    )
+
+    await message.reply_markdown(text)
+
+
+@admin_required
+async def infopvt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    sender = update.effective_user
+
+    if not message.reply_to_message:
+        await message.reply_text(
+            "Balas pesan target lalu pakai /infopvt untuk kirim info via DM."
+        )
+        return
+
+    target = message.reply_to_message.from_user
+
+    text = (
+        f"🧾 *Info Pengguna dari grup {message.chat.title}*\n\n"
+        f"ID: `{target.id}`\n"
+        f"Nama: {target.full_name}\n"
+        f"Username: @{target.username if target.username else '-'}\n"
+        f"Bot: {'Ya' if target.is_bot else 'Tidak'}\n"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=sender.id,
+            text=text,
+            parse_mode="Markdown",
+        )
+        await message.reply_text("✅ Info sudah dikirim ke DM kamu.")
+    except Exception:
+        await message.reply_text("Gagal kirim DM. Pastikan kamu pernah chat bot di private.")
+
+
+@admin_required
+async def staff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    admins = await context.bot.get_chat_administrators(chat.id)
+
+    lines = ["*Daftar Staf Grup:*", ""]
+    for a in admins:
+        role = "Owner" if a.status == "creator" else "Admin"
+        lines.append(f"- {a.user.mention_markdown()} (`{a.user.id}`) – *{role}*")
+
+    text = "\n".join(lines)
+    await update.effective_message.reply_markdown(text)
+
+
+# --------- PREMIUM COMMANDS ---------
+
+async def addpremium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if user.id not in OWNER_IDS:
+        await message.reply_text("Perintah ini cuma buat Owner bot bro.")
+        return
+
+    if chat.type not in ("group", "supergroup"):
+        await message.reply_text(
+            "Jalankan /addpremium di dalam grup yang mau dijadikan premium."
+        )
+        return
+
+    if not context.args:
+        await message.reply_text("Pakai: /addpremium <jumlah_hari>\nContoh: /addpremium 30")
+        return
+
+    try:
+        days = int(context.args[0])
+        if days <= 0:
+            raise ValueError
+    except ValueError:
+        await message.reply_text("Jumlah hari tidak valid.")
+        return
+
+    now = int(time.time())
+    data = load_premium()
+
+    current_premium, current_exp = is_chat_premium(chat.id)
+    if current_premium and current_exp:
+        base = current_exp
+    else:
+        base = now
+
+    new_exp = base + days * 24 * 60 * 60
+
+    data[str(chat.id)] = {
+        "expires_at": new_exp,
+        "added_by": user.id,
+    }
+    save_premium(data)
+
+    sisa_hari = int((new_exp - now) / 86400)
+
+    await message.reply_text(
+        f"✅ Grup *{chat.title}* sekarang PREMIUM.\n"
+        f"⏰ Berlaku sampai: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(new_exp))}</code>\n"
+        f"📅 Sisa ~{sisa_hari} hari.",
+        parse_mode="HTML",
+    )
+
+
+async def premstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat.type not in ("group", "supergroup"):
+        await message.reply_text("Perintah ini khusus di dalam grup.")
+        return
+
+    ok, expires_at = is_chat_premium(chat.id)
+    if not ok:
+        await message.reply_text(
+            f"❌ Grup *{chat.title}* saat ini *Bukan Premium*.",
+            parse_mode="Markdown",
+        )
+        return
+
+    sisa = expires_at - int(time.time())
+    sisa_hari = max(0, int(sisa / 86400))
+
+    await message.reply_text(
+        f"⭐ Grup *{chat.title}* adalah *GRUP PREMIUM*.\n"
+        f"⏰ Expired: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(expires_at))}</code>\n"
+        f"📅 Sisa ~{sisa_hari} hari.",
+        parse_mode="HTML",
+    )
+
+
+# =============== CALLBACK MENU ===============
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "menu_main":
+        await query.edit_message_text(
+            text=f"🏠 *Menu Utama {BOT_NAME}*",
+            reply_markup=build_main_menu(),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_help":
+        await query.edit_message_text(
+            text="🆘 *Bantuan Bot*\n\n"
+                 "Gunakan tombol di bawah untuk melihat daftar perintah dasar.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📖 Perintah Dasar", callback_data="menu_commands")],
+                    [InlineKeyboardButton("⬅️ Kembali", callback_data="menu_main")],
+                ]
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_commands":
+        await help_cmd(update, context)
+        return
+
+    if data == "menu_security":
+        text = (
+            "⚔️ *Menu Security*\n\n"
+            "Fitur terkait keamanan grup:\n"
+            "- Anti toxic\n"
+            "- Anti spam\n"
+            "- Anti link\n"
+            "- Hukuman otomatis\n\n"
+            "_(Masih kerangka, fitur detail akan ditambahkan kemudian.)_"
+        )
+        await query.edit_message_text(
+            text=text,
+            reply_markup=build_back_menu("main"),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_moderation":
+        text = (
+            "🛠 *Menu Moderation*\n\n"
+            "Gunakan command:\n"
+            "- /ban, /mute, /kick, /unban\n"
+            "- /info, /infopvt, /staff\n\n"
+            "Panel lanjutan akan ditambah kemudian."
+        )
+        await query.edit_message_text(
+            text=text,
+            reply_markup=build_back_menu("main"),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_utility":
+        text = (
+            "⚙️ *Menu Utility*\n\n"
+            "Nanti berisi fitur:\n"
+            "- Tools convert file\n"
+            "- Scraping, cek info, dll."
+        )
+        await query.edit_message_text(
+            text=text,
+            reply_markup=build_back_menu("main"),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_fun":
+        text = (
+            "😎 *Menu Fun*\n\n"
+            "Nanti berisi fitur:\n"
+            "- Games kecil\n"
+            "- Meme\n"
+            "- Dll."
+        )
+        await query.edit_message_text(
+            text=text,
+            reply_markup=build_back_menu("main"),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_premium":
+        text = (
+            "⭐ *Menu Premium*\n\n"
+            "Di sini nantinya user bisa beli & cek status premium.\n"
+            "Saat ini:\n"
+            "- /premstatus → cek status grup\n"
+            "- Owner bot bisa pakai /addpremium <hari>."
+        )
+        await query.edit_message_text(
+            text=text,
+            reply_markup=build_back_menu("main"),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "menu_owner":
+        text = (
+            "👑 *Owner Panel*\n\n"
+            "Panel khusus Owner / Admin utama untuk mengatur:\n"
+            "- Limit grup\n"
+            "- Paket premium\n"
+            "- Broadcast, dll.\n\n"
+            "Masih kerangka, nanti kita expand."
+        )
+        await query.edit_message_text(
+            text=text,
+            reply_markup=build_back_menu("main"),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("settings_"):
+        await query.edit_message_text(
+            text="⚙️ Menu pengaturan detail belum diisi.\n"
+                 "Nanti akan dihubungkan ke config anti-toxic, anti-link, dll.",
+            reply_markup=build_back_menu("main"),
+        )
+
+
+# =============== MAIN ===============
 
 def main():
-    load_all()
-    print("BOT READY")
-
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Public cmds
+    # command dasar
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("addword", addword_cmd))
-    app.add_handler(CommandHandler("delword", delword_cmd))
-    app.add_handler(CommandHandler("listword", listword_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    # Premium cmds
-    app.add_handler(CommandHandler("premium_add", premium_add))
-    app.add_handler(CommandHandler("premium_remove", premium_remove))
-    app.add_handler(CommandHandler("premium_status", premium_status))
+    app.add_handler(CommandHandler("reload", reload_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("mute", mute_cmd))
+    app.add_handler(CommandHandler("kick", kick_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("info", info_cmd))
+    app.add_handler(CommandHandler("infopvt", infopvt_cmd))
+    app.add_handler(CommandHandler("staff", staff_cmd))
 
-    # Text filter
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_filter_handler))
+    # premium
+    app.add_handler(CommandHandler("addpremium", addpremium_cmd))
+    app.add_handler(CommandHandler("premstatus", premstatus_cmd))
 
+    # callback menu
+    app.add_handler(CallbackQueryHandler(menu_callback))
+
+    logger.info("Bot started...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
