@@ -15,6 +15,9 @@ from telegram.ext import (
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN env var belum di-set!")
+
 DATA_FILE = Path("blocked_words.json")
 
 # Kata kasar default (global, kepake di semua grup)
